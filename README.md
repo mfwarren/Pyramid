@@ -129,7 +129,32 @@ The main Giza scene used in the experiments was:
 
 - `S1A_IW_SLC__1SDV_20160706T155618_20160706T155645_012030_012959_83DC`
 
-The public sample and derived figures included here are enough to inspect the results, but contributors will need to obtain the original SAR products themselves for full reruns.
+It can be obtained from ASF / NASA Earthdata:
+
+- ASF datapool ZIP:
+  `https://datapool.asf.alaska.edu/SLC/SA/S1A_IW_SLC__1SDV_20160706T155618_20160706T155645_012030_012959_83DC.zip`
+- CMR granule search:
+  `https://cmr.earthdata.nasa.gov/search/granules.json?collection_concept_id=C1214470488-ASF&temporal=2016-07-06T00:00:00Z,2016-07-06T23:59:59Z&point=31.1342,29.9792&page_size=20`
+
+Notes for anyone trying to rerun the tests:
+
+- you need a NASA Earthdata account
+- you need to authorize the ASF application for that account
+- programmatic download works most easily with a `~/.netrc` entry for `urs.earthdata.nasa.gov`
+
+Minimal `~/.netrc` example:
+
+```text
+machine urs.earthdata.nasa.gov
+login YOUR_USERNAME
+password YOUR_PASSWORD
+```
+
+If ASF access has not been authorized yet, log in once through:
+
+- `https://sentinel1.asf.alaska.edu/login`
+
+The public figures and JSON summaries included in this repo are enough to inspect the results, but contributors will need to obtain the original SAR product themselves for full reruns.
 
 ## Open questions
 
