@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Giza SAR Tomography Explorer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  </head>
+  <body>
+    <main class="layout">
+      <section class="hero">
+        <p class="eyebrow">Sentinel-1 / Giza / Single-pass Doppler Tomography</p>
+        <h1>Interactive vertical slicing over the Giza IW2 VV chip</h1>
+        <p class="lede">
+          Draw a line on the plan-view SAR amplitude image. The backend samples the line,
+          rebuilds point tomograms using Sentinel-1-derived geometry, and renders the
+          vertical slice.
+        </p>
+      </section>
+
+      <section class="grid">
+        <article class="panel map-panel">
+          <div class="panel-header">
+            <div>
+              <h2>Top-down magnitude</h2>
+              <p id="map-meta">Drag to place the slice line.</p>
+            </div>
+            <button id="reset-button" type="button">Reset Line</button>
+          </div>
+          <div class="canvas-wrap">
+            <img id="map-image" src="{{ overview_data_url }}" alt="SAR magnitude map">
+            <canvas id="overlay"></canvas>
+          </div>
+        </article>
+
+        <article class="panel slice-panel">
+          <div class="panel-header">
+            <div>
+              <h2>Vertical slice</h2>
+              <p id="slice-meta">Initial slice passes through the estimated target point.</p>
+            </div>
+            <div class="badge" id="status-badge">Idle</div>
+          </div>
+          <img id="slice-image" src="{{ slice_data_url }}" alt="Vertical tomographic slice">
+          <pre id="debug-output">{{ initial_slice_debug | tojson(indent=2) }}</pre>
+        </article>
+      </section>
+
+      <section class="grid compact">
+        <article class="panel">
+          <h2>Dataset</h2>
+          <pre>{{ dataset_summary | tojson(indent=2) }}</pre>
+        </article>
+        <article class="panel">
+          <h2>Reference point</h2>
+          <pre>{{ initial_point_debug | tojson(indent=2) }}</pre>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      window.__PYRAMID_BOOTSTRAP__ = {
+        dataset: {{ dataset_summary | tojson }},
+      };
+    </script>
+    <script type="module">
+      const bootstrap = window.__PYRAMID_BOOTSTRAP__;
+      const mapImage = document.getElementById("map-image");
+      const overlay = document.getElementById("overlay");
+      const ctx = overlay.getContext("2d");
+      const sliceImage = document.getElementById("slice-image");
+      const debugOutput = document.getElementById("debug-output");
+      const statusBadge = document.getElementById("status-badge");
+      const mapMeta = document.getElementById("map-meta");
+      const resetButton = document.getElementById("reset-button");
+
+      const [defaultY, defaultX] = bootstrap.dataset.default_local_point;
+      let line = {
+        x0: overlay.width * 0.25 || defaultX - 120,
+        y0: defaultY,
+        x1: overlay.width * 0.75 || defaultX + 120,
+        y1: defaultY,
+      };
+      let dragging = null;
+      let pendingFrame = null;
+      let controller = null;
+
+      function syncCanvas() {
+        const rect = mapImage.getBoundingClientRect();
+        overlay.width = mapImage.clientWidth;
+        overlay.height = mapImage.clientHeight;
+        overlay.style.width = rect.width + "px";
+        overlay.style.height = rect.height + "px";
+        if (!pendingFrame) {
+          draw();
+        }
+      }
+
+      function datasetToCanvas(point) {
+        return {
+          x: point.x * overlay.width / mapImage.naturalWidth,
+          y: point.y * overlay.height / mapImage.naturalHeight,
+        };
+      }
+
+      function canvasToDataset(point) {
+        return {
+          x: point.x * mapImage.naturalWidth / overlay.width,
+          y: point.y * mapImage.naturalHeight / overlay.height,
+        };
+      }
+
+      function drawHandle(x, y, active) {
+        ctx.beginPath();
+        ctx.arc(x, y, active ? 8 : 6, 0, Math.PI * 2);
+        ctx.fillStyle = active ? "#ffd166" : "#f4a261";
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#08131f";
+        ctx.stroke();
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+        const p0 = datasetToCanvas({ x: line.x0, y: line.y0 });
+        const p1 = datasetToCanvas({ x: line.x1, y: line.y1 });
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = "#ffd166";
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+        drawHandle(p0.x, p0.y, dragging === "start");
+        drawHandle(p1.x, p1.y, dragging === "end");
+        mapMeta.textContent = `Slice: (${line.x0.toFixed(0)}, ${line.y0.toFixed(0)}) to (${line.x1.toFixed(0)}, ${line.y1.toFixed(0)})`;
+        pendingFrame = null;
+      }
+
+      function scheduleDraw() {
+        if (!pendingFrame) {
+          pendingFrame = requestAnimationFrame(draw);
+        }
+      }
+
+      function setStatus(text, state) {
+        statusBadge.textContent = text;
+        statusBadge.dataset.state = state;
+      }
+
+      function pickHandle(point) {
+        const p0 = datasetToCanvas({ x: line.x0, y: line.y0 });
+        const p1 = datasetToCanvas({ x: line.x1, y: line.y1 });
+        const d0 = Math.hypot(point.x - p0.x, point.y - p0.y);
+        const d1 = Math.hypot(point.x - p1.x, point.y - p1.y);
+        return d0 < d1 ? "start" : "end";
+      }
+
+      async function requestSlice() {
+        if (controller) {
+          controller.abort();
+        }
+        controller = new AbortController();
+        setStatus("Rendering", "busy");
+        try {
+          const response = await fetch("/api/slice", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...line, n_samples: 56 }),
+            signal: controller.signal,
+          });
+          const payload = await response.json();
+          sliceImage.src = payload.image;
+          debugOutput.textContent = JSON.stringify(payload.debug, null, 2);
+          setStatus("Ready", "ready");
+        } catch (error) {
+          if (error.name !== "AbortError") {
+            debugOutput.textContent = String(error);
+            setStatus("Error", "error");
+          }
+        }
+      }
+
+      function eventPoint(event) {
+        const rect = overlay.getBoundingClientRect();
+        return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      }
+
+      overlay.addEventListener("pointerdown", (event) => {
+        dragging = pickHandle(eventPoint(event));
+        overlay.setPointerCapture(event.pointerId);
+        scheduleDraw();
+      });
+
+      overlay.addEventListener("pointermove", (event) => {
+        if (!dragging) {
+          return;
+        }
+        const datasetPoint = canvasToDataset(eventPoint(event));
+        if (dragging === "start") {
+          line.x0 = datasetPoint.x;
+          line.y0 = datasetPoint.y;
+        } else {
+          line.x1 = datasetPoint.x;
+          line.y1 = datasetPoint.y;
+        }
+        scheduleDraw();
+      });
+
+      overlay.addEventListener("pointerup", async (event) => {
+        overlay.releasePointerCapture(event.pointerId);
+        dragging = null;
+        scheduleDraw();
+        await requestSlice();
+      });
+
+      resetButton.addEventListener("click", async () => {
+        line = {
+          x0: mapImage.naturalWidth * 0.25,
+          y0: defaultY,
+          x1: mapImage.naturalWidth * 0.75,
+          y1: defaultY,
+        };
+        scheduleDraw();
+        await requestSlice();
+      });
+
+      mapImage.addEventListener("load", () => {
+        syncCanvas();
+        if (!line.x0 || !line.x1) {
+          line.x0 = mapImage.naturalWidth * 0.25;
+          line.x1 = mapImage.naturalWidth * 0.75;
+        }
+        scheduleDraw();
+      });
+
+      window.addEventListener("resize", syncCanvas);
+      if (mapImage.complete) {
+        syncCanvas();
+        requestSlice();
+      }
+    </script>
+  </body>
+</html>
