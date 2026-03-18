@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -91,8 +92,34 @@ def solve_global_volume(
     return h
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Biondi-style 2D global window inversion with configurable surface support.")
+    parser.add_argument("--output-dir", type=Path, default=Path("data/processed/biondi_global_window"))
+    parser.add_argument("--line-radius", type=int, default=6, help="Max line offset in local pixels.")
+    parser.add_argument("--line-step", type=int, default=2, help="Line offset spacing in local pixels.")
+    parser.add_argument("--sample-radius", type=int, default=120, help="Max sample offset in local pixels.")
+    parser.add_argument("--sample-step", type=int, default=24, help="Sample offset spacing in local pixels.")
+    parser.add_argument("--half-lines", type=int, default=2048)
+    parser.add_argument("--half-pixels", type=int, default=1024)
+    parser.add_argument("--patch-radius", type=int, default=8)
+    parser.add_argument("--search-radius", type=int, default=4)
+    parser.add_argument("--lam-x", type=float, default=0.35)
+    parser.add_argument("--lam-y", type=float, default=0.35)
+    parser.add_argument("--lam-z", type=float, default=0.8)
+    parser.add_argument("--lam-l1", type=float, default=3e-3)
+    parser.add_argument("--n-iter", type=int, default=220)
+    return parser.parse_args()
+
+
+def build_offsets(radius: int, step: int) -> np.ndarray:
+    if step <= 0:
+        raise ValueError("step must be positive")
+    return np.arange(-radius, radius + 1, step, dtype=np.int64)
+
+
 def main() -> None:
-    output_dir = Path("data/processed/biondi_global_window")
+    args = parse_args()
+    output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset = prepare_giza_dataset(
@@ -100,15 +127,15 @@ def main() -> None:
         target_lon=TARGET_LON,
         cfg=SubApertureConfig(width_bins=48, step_bins=8, n_apertures=96, taper="hann"),
         z_grid=np.linspace(-500.0, 500.0, 241),
-        half_lines=2048,
-        half_pixels=1024,
+        half_lines=args.half_lines,
+        half_pixels=args.half_pixels,
     )
     sub_slcs = prepare_tracking_subapertures(dataset, "tops_deramp_2d")
-    track_cfg = PixelTrackConfig(patch_radius=8, search_radius=4)
+    track_cfg = PixelTrackConfig(patch_radius=args.patch_radius, search_radius=args.search_radius)
 
     local_line, local_sample = dataset.default_local_point
-    line_offsets = np.arange(-6, 7, 2)
-    sample_offsets = np.arange(-120, 121, 24)
+    line_offsets = build_offsets(args.line_radius, args.line_step)
+    sample_offsets = build_offsets(args.sample_radius, args.sample_step)
     ny = len(line_offsets)
     nx = len(sample_offsets)
 
@@ -153,12 +180,29 @@ def main() -> None:
 
     Y = np.stack(Y_cols, axis=1)
     A = A_full[np.asarray(observation_indices, dtype=np.int64)]
-    H = solve_global_volume(Y, A, (ny, nx), lam_x=0.35, lam_y=0.35, lam_z=0.8, lam_l1=3e-3, n_iter=220)
+    H = solve_global_volume(
+        Y,
+        A,
+        (ny, nx),
+        lam_x=args.lam_x,
+        lam_y=args.lam_y,
+        lam_z=args.lam_z,
+        lam_l1=args.lam_l1,
+        n_iter=args.n_iter,
+    )
     volume = np.abs(H)
 
     center_column = volume[:, ny // 2, :]
     depth_profile = volume.mean(axis=(1, 2))
     peak_depth = float(dataset.z_grid[int(np.argmax(depth_profile))])
+    top_indices = np.argsort(depth_profile)[-5:][::-1]
+    edge_guard_bins = 6
+    edge_fraction = float(
+        np.mean(
+            (np.argmax(volume, axis=0) < edge_guard_bins)
+            | (np.argmax(volume, axis=0) >= len(dataset.z_grid) - edge_guard_bins)
+        )
+    )
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     mag = np.abs(dataset.chip_native)
@@ -202,13 +246,26 @@ def main() -> None:
             "pair_stride": 4,
             "series_mode": "cumulative",
             "detrend_mode": "linear",
+            "line_radius_px": args.line_radius,
+            "line_step_px": args.line_step,
+            "sample_radius_px": args.sample_radius,
+            "sample_step_px": args.sample_step,
+            "patch_radius_px": args.patch_radius,
+            "search_radius_px": args.search_radius,
             "window_shape": [ny, nx],
-            "global_regularization": {"lam_x": 0.35, "lam_y": 0.35, "lam_z": 0.8, "lam_l1": 3e-3, "n_iter": 220},
+            "global_regularization": {
+                "lam_x": args.lam_x,
+                "lam_y": args.lam_y,
+                "lam_z": args.lam_z,
+                "lam_l1": args.lam_l1,
+                "n_iter": args.n_iter,
+            },
         },
         "center_target_debug": center_debug,
         "steering_debug": steering_debug,
         "depth_profile_peak_m": peak_depth,
-        "depth_profile_top5_m": [float(dataset.z_grid[i]) for i in np.argsort(depth_profile)[-5:][::-1]],
+        "depth_profile_top5_m": [float(dataset.z_grid[i]) for i in top_indices],
+        "edge_fraction": edge_fraction,
         "volume_stats": {
             "max": float(volume.max()),
             "mean": float(volume.mean()),
